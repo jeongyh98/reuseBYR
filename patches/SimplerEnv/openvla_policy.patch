@@ -1,0 +1,165 @@
+diff --git a/simpler_env/main_inference.py b/simpler_env/main_inference.py
+index 320f268..95dd2ed 100644
+--- a/simpler_env/main_inference.py
++++ b/simpler_env/main_inference.py
+@@ -53,6 +53,14 @@ if __name__ == "__main__":
+                 init_rng=args.octo_init_rng,
+                 action_scale=args.action_scale,
+             )
++    elif args.policy_model == "openvla":
++        from simpler_env.policies.openvla.openvla_model import OpenVLAInference
++        ckpt = args.ckpt_path if (args.ckpt_path and args.ckpt_path != "None") else "openvla/openvla-7b"
++        model = OpenVLAInference(
++            saved_model_path=ckpt,
++            policy_setup=args.policy_setup,
++            action_scale=args.action_scale,
++        )
+     else:
+         raise NotImplementedError()
+ 
+diff --git a/simpler_env/policies/openvla/openvla_model.py b/simpler_env/policies/openvla/openvla_model.py
+new file mode 100644
+index 0000000..78547b5
+--- /dev/null
++++ b/simpler_env/policies/openvla/openvla_model.py
+@@ -0,0 +1,140 @@
++"""OpenVLA policy adapter for SimplerEnv (Google Robot / WidowX-Bridge). Action
++post-processing and the sticky gripper mirror the Octo adapter; only the model call differs.
++
++Environment variables (all optional):
++  SAMPLE_T=<T>       sample actions at temperature T instead of greedy decoding
++  NOISE_SEED=<s>     torch seed set once at the first episode (one stochastic run per seed)
++  MANIFOLD_LOG=1     log the per-episode demonstration-manifold score to MANIFOLD_FILE
++                     ("<episode>\t<score>"; mean over steps of the max cosine similarity to
++                     the library given by DEMO_LIBRARY, see openvla_retrieval.py)
++  RERANK_N=<n>       per-step re-ranking: sample n actions (temperature RERANK_T, default 1.0)
++                     and keep the one closest to the retrieved demonstration action
++  COLLECT=1          keep the episode's frames and actions (for building the library)
++openvla_retrieval.py must be importable (PYTHONPATH) for MANIFOLD_LOG and RERANK_N.
++"""
++import atexit
++import os
++from typing import Optional
++
++import numpy as np
++import torch
++from PIL import Image
++from transforms3d.euler import euler2axangle
++from transformers import AutoModelForVision2Seq, AutoProcessor
++
++
++class OpenVLAInference:
++    def __init__(self, saved_model_path: str = "openvla/openvla-7b", policy_setup: str = "google_robot",
++                 image_size: int = 224, action_scale: float = 1.0):
++        os.environ["TOKENIZERS_PARALLELISM"] = "false"
++        if policy_setup == "google_robot":
++            self.unnorm_key = "fractal20220817_data"; self.sticky_gripper_num_repeat = 15
++        elif policy_setup == "widowx_bridge":
++            self.unnorm_key = "bridge_orig"; self.sticky_gripper_num_repeat = 1
++        else:
++            raise NotImplementedError(policy_setup)
++        self.policy_setup = policy_setup
++        self.image_size = image_size
++        self.action_scale = action_scale
++        self.processor = AutoProcessor.from_pretrained(saved_model_path, trust_remote_code=True)
++        self.vla = AutoModelForVision2Seq.from_pretrained(
++            saved_model_path, attn_implementation="flash_attention_2",
++            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True).cuda().eval()
++        self.task_description = None
++        self._reset_state()
++
++    def _reset_state(self):
++        self.sticky_action_is_on = False
++        self.gripper_action_repeat = 0
++        self.sticky_gripper_action = 0.0
++        self.previous_gripper_action = None
++
++    def _write_score(self):
++        with open(os.environ.get("MANIFOLD_FILE", "manifold_scores.tsv"), "a") as f:
++            f.write(f"{self._mep}\t{float(np.mean(self._msc)):.5f}\n")
++
++    def reset(self, task_description: str) -> None:
++        self.task_description = task_description
++        self._reset_state()
++        self._rec = os.environ.get("COLLECT", "0") == "1"
++        self._traj_img = []
++        self._traj_act = []
++        ns = os.environ.get("NOISE_SEED", "")
++        if ns and not getattr(self, "_seeded", False):
++            torch.manual_seed(int(ns)); self._seeded = True
++        if os.environ.get("MANIFOLD_LOG", "0") == "1":
++            if getattr(self, "_msc", None):      # flush the previous episode
++                self._write_score()
++                self._mep = getattr(self, "_mep", 0) + 1
++            else:
++                self._mep = getattr(self, "_mep", 0)
++            self._msc = []
++
++    @torch.no_grad()
++    def _predict_raw(self, image: np.ndarray, instr: str):
++        pil = Image.fromarray(image).convert("RGB").resize((self.image_size, self.image_size))
++        prompt = f"In: What action should the robot take to {instr.lower()}?\nOut:"
++        inputs = self.processor(prompt, pil).to("cuda", dtype=torch.bfloat16)
++        N = int(os.environ.get("RERANK_N", "0"))
++        if N > 0:
++            import openvla_retrieval as rr
++            retr = rr.retrieve(pil)
++            T = float(os.environ.get("RERANK_T", "1.0"))
++            cands = [np.asarray(self.vla.predict_action(**inputs, unnorm_key=self.unnorm_key, do_sample=True,
++                                                        temperature=T)) for _ in range(N)]
++            return rr.select(cands, retr)
++        ST = os.environ.get("SAMPLE_T", "")
++        if ST:
++            return np.asarray(self.vla.predict_action(**inputs, unnorm_key=self.unnorm_key, do_sample=True,
++                                                      temperature=float(ST)))
++        return np.asarray(self.vla.predict_action(**inputs, unnorm_key=self.unnorm_key, do_sample=False))
++
++    def step(self, image: np.ndarray, task_description: Optional[str] = None, *args, **kwargs):
++        if task_description is not None and task_description != self.task_description:
++            self.reset(task_description)
++        assert image.dtype == np.uint8
++        if os.environ.get("MANIFOLD_LOG", "0") == "1":
++            import openvla_retrieval as rr
++            rr._load()
++            with torch.no_grad():
++                q = rr._enc([image])                     # (1, 1536) L2-normalized
++                self._msc = getattr(self, "_msc", [])
++                self._msc.append(float((q @ rr._img.T).max().item()))
++            if not getattr(self, "_atexit_set", False):
++                atexit.register(lambda: self._msc and self._write_score())   # last episode
++                self._atexit_set = True
++        raw_actions = self._predict_raw(image, self.task_description)  # (7,)
++        if getattr(self, "_rec", False):
++            self._traj_img.append(image.copy())
++            self._traj_act.append(np.asarray(raw_actions, np.float32).copy())
++        raw_action = {
++            "world_vector": np.array(raw_actions[:3]),
++            "rotation_delta": np.array(raw_actions[3:6]),
++            "open_gripper": np.array(raw_actions[6:7]),  # [0,1]; 1=open 0=close
++        }
++        action = {}
++        action["world_vector"] = raw_action["world_vector"] * self.action_scale
++        roll, pitch, yaw = np.asarray(raw_action["rotation_delta"], dtype=np.float64)
++        ax, ang = euler2axangle(roll, pitch, yaw)
++        action["rot_axangle"] = ax * ang * self.action_scale
++        if self.policy_setup == "google_robot":
++            cur = raw_action["open_gripper"]
++            if self.previous_gripper_action is None:
++                rel = np.array([0.0])
++            else:
++                rel = self.previous_gripper_action - cur  # 1=close -1=open
++            self.previous_gripper_action = cur
++            if np.abs(rel) > 0.5 and self.sticky_action_is_on is False:
++                self.sticky_action_is_on = True; self.sticky_gripper_action = rel
++            if self.sticky_action_is_on:
++                self.gripper_action_repeat += 1; rel = self.sticky_gripper_action
++            if self.gripper_action_repeat == self.sticky_gripper_num_repeat:
++                self.sticky_action_is_on = False; self.gripper_action_repeat = 0; self.sticky_gripper_action = 0.0
++            action["gripper"] = rel
++        else:  # widowx_bridge
++            action["gripper"] = 2.0 * (raw_action["open_gripper"] > 0.5) - 1.0
++        action["terminate_episode"] = np.array([0.0])
++        return raw_action, action
++
++    def visualize_epoch(self, *a, **k):
++        pass
